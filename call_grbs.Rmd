@@ -1,0 +1,386 @@
+---
+title: "callGRBs"
+author: "Nathan Harmston"
+output: html_document
+---
+
+```{r}
+library(rtracklayer)
+library(depmixS4)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(BSgenome.Ggallus.UCSC.galGal4)
+library(stringr)
+library(GenomicFeatures)
+library(biomaRt)
+```
+
+Uses a HMM to identify states of the genome that are enriched for CNEs. Requires a GRanges-like object containing the CNE density for a given set of CNEs. 
+
+```{r, hmm_function}
+
+identifyEnrichedRegions <- function(bw, niterations=1){
+    data= data.frame(score=bw$score)
+    nstates = 2
+    
+    ntimes = nrow(data)
+    forward.results = list()
+    backward.results = list()
+    finished = 1
+    iteration = 0
+
+    while(finished < niterations+1){
+        iteration = iteration + 1
+        print(iteration)
+        try({
+            mod = depmix(score ~ 1, family=gaussian(), nstates=nstates, data=data, ntimes=ntimes)
+            fm2 <- fit(mod, verbose = TRUE)
+            forward.results[[finished]] = fm2
+            print(finished)
+            finished = finished + 1
+        })
+    }
+
+    mod = NULL
+    rev.data = data.frame(score=rev(bw$score))
+    finished = 1
+    iteration = 0
+
+    while(finished < niterations+1){
+        iteration = iteration + 1
+        print(iteration)
+        try({
+            mod = depmix(score ~ 1, family=gaussian(), nstates=nstates, data=rev.data, ntimes=ntimes)
+            fm2 <- fit(mod, verbose = TRUE)
+            backward.results[[finished]] = fm2
+            print(finished)
+            finished = finished + 1
+        })
+    }
+
+    forward.ll = sapply(forward.results, logLik)
+    backward.ll = sapply(backward.results, logLik)
+    i.f = which(forward.ll == max(forward.ll))[1]
+    i.r = which(backward.ll == max(backward.ll))[1]
+
+    f.index = ifelse( sum(posterior(forward.results[[i.f]])[,1]==1) <  sum(posterior(forward.results[[i.f]])[,1]==2), 1, 2 ) 
+
+    r.index = ifelse( sum(posterior(backward.results[[i.f]])[,1]==1) <  sum(posterior(backward.results[[i.f]])[,1]==2), 1, 2 )
+
+    map.states.forward = posterior(forward.results[[i.f]])[,1] == f.index
+    bw$fstate = map.states.forward
+    map.states.backward = posterior(backward.results[[i.r]])[,1] == r.index
+    bw$rstate = rev(map.states.backward)
+    bw.cvg = coverage(bw[ bw$fstate | bw$rstate ])
+    hmm.regions = slice(bw.cvg, 1)
+    results.granges = GRanges()
+    results = list()
+    for(i in seqlevels(density.bw)){
+        print(i)
+        if(length(hmm.regions[[i]]) > 0){
+            results[[i]] = GRanges(i, IRanges(start(hmm.regions[[i]]), end(hmm.regions[[i]])), "*", seqlengths=seqlengths(bw))
+        }
+    }
+    return(do.call(c, unname(results)))
+}
+```
+
+
+
+```{r}
+distanceCluster <- function(ranges, nClusters){
+    require(IRanges)
+
+    rangesGaps <- gaps(ranges)
+    widthsGaps <- width(rangesGaps)
+    breaksOfGaps <- sort(order(widthsGaps, decreasing=TRUE)[1:(nClusters-1)])
+    clustersIndices <- Rle(1:length(breaksOfGaps), c(breaksOfGaps[1], diff(breaksOfGaps)))
+    clustersIndices <- Rle(1:(1+length(breaksOfGaps)), c(breaksOfGaps[1], diff(breaksOfGaps), length(ranges) - length(clustersIndices)))
+    sumOfDistance <- sum(sum(width(gaps(split(ranges, as.integer(clustersIndices))))))
+    return(list(indices=as.integer(clustersIndices),
+                sod=sumOfDistance))
+}
+```
+
+
+Allows import of CNEs from asc files (i.e containing both query and target species), target argument determines which set to return. 
+```{r}
+import.cnes = function(fn, target){
+    tmp = str_split(fn, "/")
+    tmp = str_split(tmp[[1]][ length(tmp[[1]])], "_")
+    species1 = tmp[[1]][2]
+    species2 = tmp[[1]][3]
+    tmp  = read.table(fn)
+  
+    if(target == species1){
+        return( GRanges(tmp[,1], IRanges(tmp[,2]+1, tmp[,3]), name=paste(tmp[,4], paste(tmp[,5]+1, tmp[,6], sep="-"), sep=":"), origin.chr=as.character(tmp[,4])) )
+    }else{
+        return( GRanges(tmp[,4], IRanges(tmp[,5]+1, tmp[,6]), name=paste(tmp[,1], paste(tmp[,2]+1, tmp[,3], sep="-"), sep=":"), origin.chr=as.character(tmp[,1])) )
+    }
+}
+```
+
+```{r}
+generate.grbs.raw.split.gaps = function(raw, grangesCNEs, n.largest.gaps.quantile, refChromSize){
+    GRBraw <- list()
+    for(chr in as.character(unique(runValue(seqnames(grangesCNEs))))){
+        grangesCNEschr <- grangesCNEs[seqnames(grangesCNEs) == chr]
+        grangesCNEschr <- reduce(grangesCNEschr)
+        grangesGaps <- gaps(grangesCNEschr)
+        #grangesGaps <- grangesGaps[seqnames(grangesGaps) == chr & strand(grangesGaps) == "+"] # CHECK THIS
+        nclusters <- sum(width(grangesGaps) > quantile(width(grangesGaps), probs=c(n.largest.gaps.quantile))) # this appears to the parameter that is hard to determine
+        clustersIndices <- distanceCluster(ranges(grangesCNEschr),
+                                       nClusters=nclusters)
+        grangesCNEschr$cluster <- clustersIndices$indices
+        foo = split(grangesCNEschr, grangesCNEschr$cluster)
+        starts <- sapply(foo, function(x){ min(start(x)) } )
+        ends <- sapply(foo, function(x){ max(end(x)) } )
+        clusterRanges <- GRanges(seqnames=chr,
+                             ranges=IRanges(start=starts,
+                                            end=ends),
+                             strand="*",
+                             seqlengths=refChromSize)
+        GRBraw[[chr]] <- clusterRanges
+    }
+    GRBraw <- do.call(c, unname(GRBraw))
+    return(GRBraw)
+}
+
+merge.grbs.in.same.genes = function(to.merge, ens.genes){
+  tmp.ol = findOverlaps(to.merge, ens.genes)
+  tmp.ol = tmp.ol[subjectHits(tmp.ol) %in% names(table(subjectHits(tmp.ol)))[table(subjectHits(tmp.ol))>1]]
+  merged = GRanges()
+  if(length(tmp.ol)>0){
+    for(i in unique(subjectHits(tmp.ol))){
+        tmp.set = to.merge[ queryHits(tmp.ol)[subjectHits(tmp.ol)==i]]
+        tmp.range = GRanges(seqnames=seqnames(tmp.set)[1], IRanges(min(start(tmp.set)), max(end(tmp.set))))
+        merged = c(merged, tmp.range)
+    }
+  }
+  to.merge = reduce(c(merged, to.merge))
+  return(to.merge)
+}
+
+split.states.source.chromosome = function(GRBraw, grangesCNEs, refChromSize){
+    GRBorigin = list()
+
+    for(i in 1:length(GRBraw)){
+        tmp = findOverlaps(GRBraw[i], grangesCNEs)
+        tmp.gr = grangesCNEs[ unique(subjectHits(tmp)) ]
+        foo = split(tmp.gr, tmp.gr$origin.chr)    
+        chr <- sapply(foo, function(x){ unique(seqnames(x)) } )
+        starts <- sapply(foo, function(x){ min(start(x)) } )
+        ends <- sapply(foo, function(x){ max(end(x)) } )
+        clusterRanges <- GRanges(seqnames=chr,
+                             ranges=IRanges(start=starts,
+                                            end=ends),
+                             strand="*", origin.chr = names(foo), raw.id=i, number.cnes=sapply(foo, length),
+                             seqlengths=refChromSize)
+    GRBorigin[[i]] = clusterRanges
+    }
+    GRBorigin = do.call(c, unname(GRBorigin))
+    return(GRBorigin)
+}
+
+# this function is an absolute mess due to the identification of a lot of edge cases I didn't consider
+merge.potential.grbs = function(GRBbychr, min.merge.distance){
+  GRBmerged = list()
+  GRBcannotmerge = list()
+  for(chr in names(GRBbychr)){  # for each chr in reference
+    GRBmerged[[chr]] = list()
+    GRBcannotmerge[[chr]] = list()
+    tmp.gr = split(GRBbychr[[chr]], GRBbychr[[chr]]$origin.chr)
+    for(name in names(tmp.gr)){ # for each chrof the other species that has a cne mapping to this chr
+      tmp.gr.chr = tmp.gr[[name]]
+      # split into orphan (i.e does not overlap a valid gene) and those which are potentially a real GRB
+      real.set = tmp.gr.chr[tmp.gr.chr$orphan == 0]
+      orphan.set = tmp.gr.chr[tmp.gr.chr$orphan == 1]
+      
+      if(length(orphan.set) > 0){
+        i = 1
+        while(TRUE){ # TODO
+          if(length(orphan.set)==0 | i > length(orphan.set)){
+            break
+          }
+          
+          orphan = orphan.set[i]
+          
+          dpo = distance(real.set, orphan)
+          dpo.min = min(dpo)
+          
+          tmp.orphan.set = orphan.set[-i]
+          doo = distance(tmp.orphan.set, orphan)
+
+          if(length(tmp.orphan.set)==0){
+            doo.min = Inf
+          }else{
+            doo.min = min(doo)
+          }        
+          
+          if(doo.min < dpo.min & doo.min < min.merge.distance){ 
+            qi = tmp.orphan.set[ which(doo==doo.min)]           
+            tmp.orphan = GRanges(seqnames(qi), IRanges(min(start(qi), start(orphan.set[i])), max(end(qi), end(orphan.set[i]))),
+                                 origin.chr = name, raw.id = -1, number.cnes = qi$number.cnes + orphan.set[i]$number.cnes, orphan=1)
+            if( length(findOverlaps(ens.genes, tmp.orphan, type="within")) == 0){
+              orphan.set[i] = tmp.orphan
+              tmp = findOverlaps(tmp.orphan, orphan.set)
+              if(length(tmp) != 2){ print(i); print("SHIT"); break}
+              orphan.set = orphan.set[ -subjectHits(tmp[2]) ] 
+            }else{ # its not an orphan anymore
+              tmp.orphan$orphan = 0
+              real.set = c(real.set, tmp.orphan) 
+              tmp = findOverlaps(tmp.orphan, orphan.set)
+              orphan.set = orphan.set[  -subjectHits(tmp) ]
+            }   
+        }else if(dpo.min < doo.min & dpo.min < min.merge.distance){ # merge with potential
+            qi = which(dpo==dpo.min)
+            real.set[qi] = GRanges(seqnames(real.set[qi]), IRanges(min(start(real.set[qi]), start(orphan.set[i])), max(end(real.set[qi]), end(orphan.set[i]))),
+                                   origin.chr = name, raw.id = -1, number.cnes = orphan.set[i]$number.cnes + real.set[qi]$number.cnes, orphan=0)
+            orphan.set = orphan.set[ -i ] 
+        }else{
+          i = i + 1
+         }
+        }
+      }
+      GRBmerged[[chr]][[name]] = real.set
+      GRBcannotmerge[[chr]][[name]] = orphan.set
+    }
+  }
+  final.set = do.call(c, unname(GRBmerged))
+  final.set = do.call(c, unname(final.set))
+  final.orphan.set = do.call(c, unname(GRBcannotmerge))
+  final.orphan.set = do.call(c, unname(final.orphan.set))
+  return(list(final=final.set, orphan=final.orphan.set))   
+}
+
+output.grbs = function(grbs, fn, ucsc.chr.cols){
+  names(grbs) = NULL
+  grbs.df = as.data.frame(grbs)
+  grbs.df = as.data.frame(grbs)[, c("seqnames", "start", "end")]
+  grbs.df[, "start"] = grbs.df[, "start"] - 1
+  grbs.df[, "name"] = paste(paste(seqnames(grbs), paste(start(grbs)-1, end(grbs), sep="-"), sep=":"), grbs$origin.chr, grbs$number.cnes, sep=",")
+  grbs.df[, "score"] = grbs$number.cnes
+  grbs.df[, "strand"] = "."
+  grbs.df[, "thickStart"] = start(grbs)
+  grbs.df[, "thickEnd"] = end(grbs)
+  grbs.df[, "itemRgb"] = sapply(grbs$origin.chr, function(x){ if(x %in% names(ucsc.chr.cols)){ucsc.chr.cols[[x]]}else{"0,0,0"}})
+
+  tmp.fn <- file(fn, "w")
+  cat(paste("track name=\"", genome.one, genome.two, "GRBS\" description=\"", genome.one, " ", genome.two, " ", cne.pc.id,  " / ", cne.col, "\" GRBs itemRgb=\"On\"\n", sep=""), file=tmp.fn)
+  write.table(grbs.df, file=tmp.fn, quote=FALSE, sep="\t", row.names=FALSE, col.names=FALSE)
+  close(tmp.fn)
+}
+```
+
+WORKFLOW
+=============
+
+So we're interested in finding GRBs between hg19 and galGal4 using cnes with 70% identity over 50bp. 
+
+```{r}
+genome.one = "hg19"
+genome.two = "galGal4"
+cne.pc.id = 70
+cne.col = 50
+n.largest.gaps.quantile = 0.98 # galGal4
+min.merge.distance = 300000
+```
+
+First we need a set of genes for the species of interest. Here I'm only using protein-coding genes
+```{r}
+hg19.ens.db <- makeTxDbFromUCSC(genome="hg19", tablename="ensGene")
+ens.genes = genes(hg19.ens.db)
+human = useMart(dataset="hsapiens_gene_ensembl", biomart="ENSEMBL_MART_ENSEMBL", host="feb2014.archive.ensembl.org")
+
+bm.annotations = getBM(attributes=c("ensembl_gene_id", "gene_biotype", "hgnc_symbol", "description", "status"), mart=human, filters="ensembl_gene_id", values=ens.genes$gene_id, uniqueRows=TRUE)
+
+ens.genes$hgnc_symbol = bm.annotations$hgnc_symbol[ match(ens.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ens.genes$gene_biotype = bm.annotations$gene_biotype[ match(ens.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ens.genes$description = bm.annotations$description[ match(ens.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ens.genes$status = bm.annotations$status[ match(ens.genes$gene_id, bm.annotations$ensembl_gene_id) ]
+ens.genes = ens.genes[ seqnames(ens.genes) %in% c(paste("chr", 1:22, sep=""), "chrX", "chrY")]
+ens.genes = ens.genes[ ens.genes$gene_biotype %in% c( "protein_coding" ) ] 
+ens.genes = ens.genes[ ens.genes$status != "PUTATIVE" & ens.genes$status != "NOVEL"]
+```
+
+Now we read in the corresponding CNE density and individual CNEs. 
+
+```{r}
+dens.fn = "/Users/nph/Documents/workspace/grbs_tads/densities/HCNE_density_hg19_galGal4_70pc_50col.bigWig"
+cnes  = import.cnes("/Users/nph/Documents/workspace/grbs_tads/cnes/cne2wBf_galGal4_hg19_35_50.asc", target="hg19")
+density.bw = import(dens.fn)
+density.bw = density.bw[ seqnames(density.bw)  %in%  c( paste("chr", 1:22, sep=""), "chrX", "chrY")]
+```
+
+Now lets identify enriched regions of CNEs within the genome, using a HMM. Running this over and over again until a set of weights is optimised that works. In the majority of times I've used this running for multiple iterations returns the same fit to the data - but there have been a couple of times where I've had multiple parameter sets. The method returns the set of states called using the fit with the best BIC. 
+
+One issue may be that the set of states that are returned are the wrong way around - raw doesn't contain enriched CNE states but depleted CNE states. This is easy to check and can be fixed with gaps(raw) etc. 
+
+```{r}
+raw = identifyEnrichedRegions(density.bw)
+elementMetadata(raw)= NULL
+```
+
+We know that a CNEs within a gene should be part of the same state, so we merged putative states together if they overlap the same gene. 
+
+```{r}
+raw = merge.grbs.in.same.genes(raw, ens.genes)
+seqinfo(raw) = seqinfo(BSgenome.Hsapiens.UCSC.hg19::Hsapiens)
+```
+
+I recommend exporting this raw file and having a look in IGV comparing it with observed CNE density at a few loci (LPHN2, IRX3 region) and genome-wide. 
+
+Next we perform clustering based on the distribution of distances between CNEs that are found within these states. This requires the setting of a parameter n.largest.gaps.quantile. Playing around with this threshold suggested that as the evolutionary distance between the two species of interest increased, the quantile used needed to be decreased. We used 0.98 for hg19-monDom5 comparisons, 0.98 for hg19-galGal4, and 0.93 for hg19-lepOcu1 and 0.97 for dm3-droMoj3 comparisons. This is guess work and the best thing to do is usually to run this with different values and seeing what the final result is like...i.e. what happens at a couple of loci. I'm not a big fan of pulling out a parameter from thin air but it works (trust Ge and me). Again we combine any states that overlap the same gene. 
+
+```{r}
+grangesCNEs = cnes[ unique(queryHits(findOverlaps(cnes, raw)))  ]
+refChromSize = seqlengths(BSgenome.Hsapiens.UCSC.hg19::Hsapiens)[ names(seqlengths(BSgenome.Hsapiens.UCSC.hg19::Hsapiens))  %in%  c( paste("chr", 1:22, sep=""), "chrX", "chrY")]
+GRBraw = generate.grbs.raw.split.gaps(raw, grangesCNEs, n.largest.gaps.quantile, refChromSize)
+GRBraw = merge.grbs.in.same.genes(GRBraw, ens.genes)
+```
+
+Ok, so now we have a set of putative GRBs identified from enriched regions of chromatin that cluster using the distances between them. Now we can split these into putative sets of syntenic states, by looking at the chromosome of origin for each of them. 
+
+```{r}
+GRBorigin = split.states.source.chromosome(GRBraw, grangesCNEs, refChromSize)
+```
+
+Now its time to merge adjacent states. I do this by first identifying whether or not a state contains a protein-coding gene within it (i've tried this both pc and mirnas and it really does make everything a mess). If it doesn't have a gene then its an orphan and needs to be merged...can't have a GRB without a target or bystander. This is another parameter you need to pick out from thin air... again try a couple, and see.....sorry but identifying GRBs isn't a pure science. 
+
+```{r}
+GRBorigin$orphan = 1
+GRBorigin$orphan[unique(subjectHits(findOverlaps(ens.genes, GRBorigin, type="within")))] = 0
+GRBbychr = split(GRBorigin, seqnames(GRBorigin))
+merged.results = merge.potential.grbs(GRBbychr, min.merge.distance) 
+```
+
+Now we can get our (almost) final set of GRBs out....
+
+```{r}
+x.final.set = merged.results[["final"]]
+x.final.orphan.set = merged.results[["orphan"]]
+```
+
+One of the things I've found helps is to remove GRBs that have low numbers of CNEs within them (this may or not be useful for you - and I've sure you understand the folly of counting these things). First recalculate the number of CNEs contained within each GRB. 
+
+```{r}
+for(i in unique(cnes$origin.chr)){
+  x.final.set$number.cnes[ x.final.set$origin.chr==i] = countOverlaps(x.final.set[ x.final.set$origin.chr==i], 
+                                                                      cnes[cnes$origin.chr==i])
+}
+for(i in unique(cnes$origin.chr)){
+  x.final.orphan.set$number.cnes[ x.final.orphan.set$origin.chr==i] = countOverlaps(x.final.orphan.set[ x.final.orphan.set$origin.chr==i], 
+                                                                      cnes[cnes$origin.chr==i])
+}
+```
+
+So this a set of filters you can try ... so now we allow orphans that only partially overlap genes but they have to have more than 10 CNEs within them. 
+```{r}
+x.final.orphan.set = x.final.orphan.set[x.final.orphan.set$number.cnes > 10]
+final.grbs = c(x.final.set, x.final.orphan.set[unique(queryHits(findOverlaps(x.final.orphan.set, ens.genes)))])
+```
+
+Now output some CNEs.....
+
+```{r}
+output.grbs(final.grbs[final.grbs$number.cnes > 10], paste(genome.one, genome.two, cne.pc.id, cne.col, "filtered.bed", sep="."), ucsc.chr.cols)
+```
